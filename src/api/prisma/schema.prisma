@@ -6,39 +6,126 @@ datasource db {
   provider = "mysql"
 }
 
+//////////////////////////////////////////////////
+// ENUMS
+//////////////////////////////////////////////////
+
 enum UserStatus {
   ACTIVE
   INACTIVE
   BANNED
 }
 
+enum Role {
+  ADMIN
+  USER
+}
+
+enum OAuthProvider {
+  GOOGLE
+  FACEBOOK
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+/// Người lớn (12+) / Trẻ em (5–11, 1/2 giá) / Em bé (<2 tuổi, miễn phí)
+enum BookingPassengerAgeCategory {
+  ADULT
+  CHILD
+  INFANT
+}
+
+/// Dòng tour (filter UI: Cao cấp / Tiêu chuẩn / Tiết kiệm / Giá tốt)
+enum TourLine {
+  PREMIUM
+  STANDARD
+  ECONOMY
+  GOOD_VALUE
+}
+
+/// Phương tiện chính (Xe / Máy bay / kết hợp)
+enum TransportType {
+  BUS
+  FLIGHT
+  MIXED
+}
+
+/// Loại nhà cung cấp dịch vụ
+enum SupplierType {
+  TRANSPORT
+  HOTEL
+  RESTAURANT
+  GUIDE
+  ACTIVITY
+}
+
+/// Loại phương tiện cụ thể
+enum VehicleType {
+  CAR_4
+  CAR_7
+  BUS_16
+  BUS_29
+  BUS_45
+  FLIGHT
+  TRAIN
+  BOAT
+  CABLE_CAR
+}
+
+/// Bữa ăn
+enum MealType {
+  BREAKFAST
+  LUNCH
+  DINNER
+  SNACK
+}
+
+//////////////////////////////////////////////////
+// USER
+//////////////////////////////////////////////////
+
 model User {
   id Int @id @default(autoincrement())
 
   email        String @unique
-  phone String?
+  phone        String?
   passwordHash String
 
   firstName String?
   lastName  String?
 
   status UserStatus @default(INACTIVE)
+  role   Role       @default(USER)
 
   invitationToken             String?
   invitationTokenExpiredAtUtc DateTime?
 
   failedLoginCount Int @default(0)
 
+  emailVerified      Boolean   @default(false)
+  emailVerifiedAtUtc DateTime?
+
+  /// false nếu chỉ đăng nhập OAuth (chưa đặt mật khẩu cục bộ)
+  hasPassword Boolean @default(true)
+
   createdAtUtc DateTime @default(now())
   updatedAtUtc DateTime @updatedAt
 
-  emailVerified Boolean
-  emailVerifiedAtUtc DateTime?
-
-  roles UserRole[]
-
+  // relations
   refreshTokens RefreshToken[]
   resetTokens   ResetPasswordToken[]
+  oauthAccounts OAuthAccount[]
 
   bookings      Booking[]
   reviews       Review[]
@@ -49,43 +136,16 @@ model User {
   behaviors     UserBehavior[]
 }
 
-model Role {
-  id       Int    @id @default(autoincrement())
-  roleName String @unique
-
-  users       UserRole[]
-  permissions RolePermission[]
-}
-
-model UserRole {
-  userId Int
-  roleId Int
-
-  user User @relation(fields: [userId], references: [id])
-  role Role @relation(fields: [roleId], references: [id])
-
-  @@id([userId, roleId])
-}
-
-model RolePermission {
-  id Int @id @default(autoincrement())
-
-  roleId       Int
-  resourceName String
-  permission   Int
-
-  role Role @relation(fields: [roleId], references: [id])
-}
+//////////////////////////////////////////////////
+// AUTH
+//////////////////////////////////////////////////
 
 model RefreshToken {
   id String @id @default(uuid())
 
   userId Int
-
   refreshToken String @unique
-
   accessTokenJti String
-
   expiredDateTimeUtc DateTime
 
   user User @relation(fields: [userId], references: [id])
@@ -97,135 +157,196 @@ model BlacklistedAccessToken {
   id Int @id @default(autoincrement())
 
   userId Int
-  jti    String
+  jti String
 
   expiredDateTimeUtc DateTime
+
+  @@index([userId])
 }
 
 model ResetPasswordToken {
   id Int @id @default(autoincrement())
 
   userId Int
-
   token String @unique
-
   expiredDateTimeUtc DateTime
-
   isSentEmail Boolean @default(false)
 
   user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
 }
 
+model OAuthAccount {
+  id Int @id @default(autoincrement())
+
+  userId Int
+  provider       OAuthProvider
+  providerUserId String
+
+  createdAtUtc DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+}
+
+//////////////////////////////////////////////////
+// LOCATION
+//////////////////////////////////////////////////
+
 model Region {
-  id        Int        @id @default(autoincrement())
-  name      String?
+  id Int @id @default(autoincrement())
+  name String?
+
   provinces Province[]
 }
 
 model Province {
-  id       Int     @id @default(autoincrement())
+  id Int @id @default(autoincrement())
   regionId Int
-  name     String?
+  name String?
 
-  region    Region     @relation(fields: [regionId], references: [id])
+  region Region @relation(fields: [regionId], references: [id])
   locations Location[]
 }
 
 model Location {
-  id          Int      @id @default(autoincrement())
-  provinceId  Int
-  name        String?
-  latitude    Decimal?
-  longitude   Decimal?
+  id Int @id @default(autoincrement())
+  provinceId Int
+  name String?
+  latitude Decimal?
+  longitude Decimal?
   description String?
-  isActive    Boolean?
+  isActive Boolean?
 
   province Province @relation(fields: [provinceId], references: [id])
-  tours    Tour[]
+  toursDeparture   Tour[] @relation("TourDeparture")
+  toursDestination Tour[] @relation("TourDestination")
 }
 
-model TourCategory {
-  id          Int      @id @default(autoincrement())
-  name        String?
-  description String?
-  isActive    Boolean?
-
-  tours Tour[]
-}
+//////////////////////////////////////////////////
+// TOUR
+//////////////////////////////////////////////////
 
 model Tour {
-  id           Int       @id @default(autoincrement())
-  categoryId   Int
-  locationId   Int
-  name         String
-  slug         String?
-  description  String?
+  id Int @id @default(autoincrement())
+
+  /// Điểm khởi hành
+  departureLocationId Int
+  /// Điểm đến
+  destinationLocationId Int
+
+  name String @db.Text
+  slug String?
+  description String? @db.Text
+
   durationDays Int?
-  basePrice    Decimal?
-  maxPeople    Int?
+  basePrice Decimal?
+  maxPeople Int?
+
   thumbnailUrl String?
-  ratingAvg    Float?
+
+  ratingAvg Float?
   totalReviews Int?
-  isActive     Boolean?
-  createdAtUtc DateTime?
 
-  category TourCategory @relation(fields: [categoryId], references: [id])
-  location Location     @relation(fields: [locationId], references: [id])
+  /// Dòng tour
+  tourLine TourLine?
 
-  images        TourImage[]
-  videos        TourVideo[]
-  schedules     TourSchedule[]
-  itineraries   TourItinerary[]
-  tags          TourTagMapping[]
-  reviews       Review[]
-  wishlists     Wishlist[]
+  /// Phương tiện
+  transportType TransportType?
+
+  isActive Boolean?
+  /// Hiển thị trong khối Tour nổi bật (trang chủ + /tours?featured=true)
+  isFeatured Boolean @default(false)
+  createdAtUtc DateTime? @default(now())
+
+  /// Dịch vụ bao gồm (text, VD: "Vé máy bay, KS 4*, ăn sáng...")
+  inclusions String? @db.Text
+  /// Dịch vụ không bao gồm (text)
+  exclusions String? @db.Text
+  /// Chính sách hủy tour
+  cancellationPolicy String? @db.Text
+
+  /// RELATIONS
+  departureLocation   Location @relation("TourDeparture", fields: [departureLocationId], references: [id])
+  destinationLocation Location @relation("TourDestination", fields: [destinationLocationId], references: [id])
+
+  images      TourImage[]
+  videos      TourVideo[]
+  schedules   TourSchedule[]
+  itineraries TourItinerary[]
+  tags        TourTagMapping[]
+  reviews     Review[]
+  wishlists   Wishlist[]
+  transports  TourTransport[]
+
   embeddings    TourEmbedding[]
   userBehaviors UserBehavior[]
+
+  @@index([departureLocationId])
+  @@index([destinationLocationId])
+  @@index([tourLine])
+  @@index([transportType])
+  @@index([basePrice])
 }
 
 model TourImage {
-  id          Int      @id @default(autoincrement())
-  tourId      Int
-  imageUrl    String
+  id Int @id @default(autoincrement())
+  tourId Int
+  imageUrl String
   isThumbnail Boolean?
 
   tour Tour @relation(fields: [tourId], references: [id])
 }
 
 model TourVideo {
-  id       Int    @id @default(autoincrement())
-  tourId   Int
+  id Int @id @default(autoincrement())
+  tourId Int
   videoUrl String
 
   tour Tour @relation(fields: [tourId], references: [id])
 }
 
 model TourSchedule {
-  id             Int      @id @default(autoincrement())
-  tourId         Int
-  startDate      DateTime
-  endDate        DateTime
-  availableSeats Int?
-  bookedSeats    Int?
-  priceOverride  Decimal?
-  status         String?
+  id Int @id @default(autoincrement())
 
-  tour     Tour      @relation(fields: [tourId], references: [id])
+  tourId Int
+
+  startDate DateTime
+  endDate DateTime
+
+  availableSeats Int?
+  bookedSeats Int?
+
+  priceOverride Decimal?
+  status String?
+
+  tour Tour @relation(fields: [tourId], references: [id])
+
   bookings Booking[]
+
+  @@index([startDate])
+  @@index([tourId, startDate])
 }
 
 model TourItinerary {
-  id          Int     @id @default(autoincrement())
-  tourId      Int
-  dayNumber   Int
-  title       String?
-  description String?
+  id Int @id @default(autoincrement())
+  tourId Int
+
+  dayNumber Int
+  title String?
+  description String? @db.Text
 
   tour Tour @relation(fields: [tourId], references: [id])
+
+  accommodations TourAccommodation[]
+  meals          TourMeal[]
 }
 
 model TourTag {
-  id   Int    @id @default(autoincrement())
+  id Int @id @default(autoincrement())
   name String
 
   tours TourTagMapping[]
@@ -233,71 +354,202 @@ model TourTag {
 
 model TourTagMapping {
   tourId Int
-  tagId  Int
+  tagId Int
 
-  tour Tour    @relation(fields: [tourId], references: [id])
+  tour Tour @relation(fields: [tourId], references: [id])
   tag  TourTag @relation(fields: [tagId], references: [id])
 
   @@id([tourId, tagId])
 }
 
-model Booking {
-  id             Int       @id @default(autoincrement())
-  userId         Int
-  tourScheduleId Int
-  numberOfPeople Int
-  bookingDateUtc DateTime?
-  totalAmount    Decimal?
-  status         String?
+//////////////////////////////////////////////////
+// SUPPLIER (Nhà cung cấp dịch vụ)
+//////////////////////////////////////////////////
 
-  user     User         @relation(fields: [userId], references: [id])
+model Supplier {
+  id   Int          @id @default(autoincrement())
+  name String
+  type SupplierType
+
+  phone   String?
+  email   String?
+  address String?
+  website String?
+  taxCode String?
+  notes   String? @db.Text
+
+  isActive     Boolean   @default(true)
+  createdAtUtc DateTime? @default(now())
+
+  transports     TourTransport[]
+  accommodations TourAccommodation[]
+  meals          TourMeal[]
+}
+
+/// Chi tiết từng chặng vận chuyển của tour
+model TourTransport {
+  id     Int @id @default(autoincrement())
+  tourId Int
+
+  supplierId Int?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  /// Thứ tự chặng (1, 2, 3...)
+  legOrder      Int
+  vehicleType   VehicleType
+  vehicleDetail String?
+  seatClass     String?
+
+  departurePoint  String
+  arrivalPoint    String
+  estimatedHours  Decimal?
+  notes           String? @db.Text
+
+  tour Tour @relation(fields: [tourId], references: [id])
+
+  @@index([tourId])
+}
+
+/// Khách sạn / lưu trú theo từng ngày lịch trình
+model TourAccommodation {
+  id          Int @id @default(autoincrement())
+  itineraryId Int
+
+  supplierId Int?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  hotelName    String
+  starRating   Int?
+  roomType     String?
+  checkInNote  String?
+  checkOutNote String?
+  address      String?
+  mapUrl       String?
+
+  itinerary TourItinerary @relation(fields: [itineraryId], references: [id])
+
+  @@index([itineraryId])
+}
+
+/// Bữa ăn theo từng ngày lịch trình
+model TourMeal {
+  id          Int @id @default(autoincrement())
+  itineraryId Int
+
+  supplierId Int?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  mealType       MealType
+  restaurantName String?
+  menuStyle      String?
+  dietaryNotes   String?
+
+  itinerary TourItinerary @relation(fields: [itineraryId], references: [id])
+
+  @@index([itineraryId])
+}
+
+//////////////////////////////////////////////////
+// BOOKING
+//////////////////////////////////////////////////
+
+model Booking {
+  id Int @id @default(autoincrement())
+
+  userId Int?
+  tourScheduleId Int
+
+  numberOfPeople Int
+  bookingDateUtc DateTime? @default(now())
+  totalAmount Decimal?
+
+  /// Thông tin liên lạc (người đặt)
+  contactFullName String?
+  contactEmail    String?
+  contactPhone    String?
+  contactAddress  String?
+
+  /// Ghi chú thêm
+  notes String? @db.Text
+
+  status BookingStatus @default(PENDING)
+  /// TTL cho trạng thái chờ thanh toán/xử lý
+  expiredAtUtc DateTime?
+
+  user     User?        @relation(fields: [userId], references: [id])
   schedule TourSchedule @relation(fields: [tourScheduleId], references: [id])
 
   passengers BookingPassenger[]
   payments   Payment[]
   history    BookingStatusHistory[]
+
+  @@index([userId])
+  @@index([status, expiredAtUtc])
 }
 
 model BookingPassenger {
-  id             Int       @id @default(autoincrement())
-  bookingId      Int
-  fullName       String
-  dateOfBirth    DateTime?
-  gender         String?
+  id Int @id @default(autoincrement())
+
+  bookingId Int
+
+  ageCategory BookingPassengerAgeCategory
+
+  fullName String
+  dateOfBirth DateTime?
+  gender String?
   passportNumber String?
 
   booking Booking @relation(fields: [bookingId], references: [id])
 }
 
 model BookingStatusHistory {
-  id           Int       @id @default(autoincrement())
-  bookingId    Int
-  oldStatus    String?
-  newStatus    String?
-  changedAtUtc DateTime?
+  id Int @id @default(autoincrement())
+
+  bookingId Int
+  oldStatus BookingStatus?
+  newStatus BookingStatus?
+
+  changedAtUtc DateTime? @default(now())
 
   booking Booking @relation(fields: [bookingId], references: [id])
 }
+
+//////////////////////////////////////////////////
+// PAYMENT
+//////////////////////////////////////////////////
 
 model Payment {
-  id              Int       @id @default(autoincrement())
-  bookingId       Int
-  paymentGateway  String?
-  paymentMethod   String?
+  id Int @id @default(autoincrement())
+
+  bookingId Int
+
+  paymentGateway String?
+  paymentMethod String?
   transactionCode String?
-  amount          Decimal?
-  status          String?
-  paidAtUtc       DateTime?
+
+  amount Decimal?
+
+  status PaymentStatus @default(PENDING)
+  paidAtUtc DateTime?
 
   booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@index([bookingId])
 }
 
+//////////////////////////////////////////////////
+// SOCIAL
+//////////////////////////////////////////////////
+
 model Review {
-  id           Int       @id @default(autoincrement())
-  userId       Int
-  tourId       Int
-  rating       Int
-  comment      String?
+  id Int @id @default(autoincrement())
+
+  userId Int
+  tourId Int
+
+  rating Int
+  comment String?
+
   createdAtUtc DateTime? @default(now())
 
   user User @relation(fields: [userId], references: [id])
@@ -307,72 +559,110 @@ model Review {
 }
 
 model Wishlist {
-  id           Int       @id @default(autoincrement())
-  userId       Int
-  tourId       Int
-  createdAtUtc DateTime?
+  id Int @id @default(autoincrement())
+
+  userId Int
+  tourId Int
+
+  createdAtUtc DateTime? @default(now())
 
   user User @relation(fields: [userId], references: [id])
   tour Tour @relation(fields: [tourId], references: [id])
 
   @@unique([userId, tourId])
+  @@index([userId])
 }
+
+//////////////////////////////////////////////////
+// NOTIFICATION
+//////////////////////////////////////////////////
 
 model Notification {
-  id           Int       @id @default(autoincrement())
-  userId       Int
-  title        String?
-  content      String?
-  isRead       Boolean?
-  createdAtUtc DateTime?
+  id Int @id @default(autoincrement())
+
+  userId Int
+
+  title String?
+  content String?
+
+  isRead Boolean @default(false)
+
+  createdAtUtc DateTime? @default(now())
 
   user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
 }
+
+//////////////////////////////////////////////////
+// USER EXTRA
+//////////////////////////////////////////////////
 
 model UserPreference {
-  id                 Int     @id @default(autoincrement())
-  userId             Int     @unique
+  id Int @id @default(autoincrement())
+
+  userId Int @unique
+
   preferredLocations String?
-  budgetRange        String?
-  travelStyle        String?
+  budgetRange String?
+  travelStyle String?
 
   user User @relation(fields: [userId], references: [id])
 }
 
-model ChatSession {
-  id           Int       @id @default(autoincrement())
-  userId       Int
-  startedAtUtc DateTime?
+//////////////////////////////////////////////////
+// CHAT
+//////////////////////////////////////////////////
 
-  user     User          @relation(fields: [userId], references: [id])
+model ChatSession {
+  id Int @id @default(autoincrement())
+
+  userId Int?
+  /// Dùng cho guest chat: khóa ngẫu nhiên để xác thực session khi không có userId
+  sessionKey String? @unique
+  startedAtUtc DateTime? @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
   messages ChatMessage[]
 }
 
 model ChatMessage {
-  id           Int       @id @default(autoincrement())
-  sessionId    Int
-  role         String
-  content      String
-  createdAtUtc DateTime?
+  id Int @id @default(autoincrement())
+
+  sessionId Int
+
+  role String
+  content String
+
+  createdAtUtc DateTime? @default(now())
 
   session ChatSession @relation(fields: [sessionId], references: [id])
 }
 
+//////////////////////////////////////////////////
+// AI / TRACKING
+//////////////////////////////////////////////////
+
 model TourEmbedding {
-  id           Int     @id @default(autoincrement())
-  tourId       Int
-  embedding    String
+  id Int @id @default(autoincrement())
+
+  tourId Int
+
+  embedding String
   contentChunk String?
 
   tour Tour @relation(fields: [tourId], references: [id])
 }
 
 model UserBehavior {
-  id           Int       @id @default(autoincrement())
-  userId       Int
-  tourId       Int
-  action       String
-  createdAtUtc DateTime?
+  id Int @id @default(autoincrement())
+
+  userId Int
+  tourId Int
+
+  action String
+  createdAtUtc DateTime? @default(now())
 
   user User @relation(fields: [userId], references: [id])
   tour Tour @relation(fields: [tourId], references: [id])

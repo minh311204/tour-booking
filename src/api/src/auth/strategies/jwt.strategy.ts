@@ -1,19 +1,50 @@
-import { Injectable } from '@nestjs/common'
+import { Injectable, UnauthorizedException } from '@nestjs/common'
 import { PassportStrategy } from '@nestjs/passport'
 import { ExtractJwt, Strategy } from 'passport-jwt'
-import { ConfigService } from '@nestjs/config'
+import { PrismaService } from '../../prisma/prima.service'
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(configService: ConfigService) {
+  constructor(private prisma: PrismaService) {
+    const jwtSecret = process.env.JWT_SECRET
+    if (!jwtSecret) {
+      throw new Error('JWT_SECRET is required')
+    }
+
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      ignoreExpiration: false,
-      secretOrKey: configService.get<string>('JWT_SECRET'),
+      secretOrKey: jwtSecret,
     })
   }
 
   async validate(payload: any) {
-    return payload
+    const userId = Number(payload?.sub)
+    const jti: string | undefined = payload?.jti
+
+    if (!userId) throw new UnauthorizedException()
+    if (jti) {
+      const blacklisted = await this.prisma.blacklistedAccessToken.findFirst({
+        where: {
+          userId,
+          jti,
+          expiredDateTimeUtc: { gt: new Date() },
+        },
+      })
+
+      if (blacklisted) {
+        throw new UnauthorizedException()
+      }
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    })
+
+    if (!user) throw new UnauthorizedException()
+
+    return {
+      ...user,
+      jti,
+    }
   }
 }

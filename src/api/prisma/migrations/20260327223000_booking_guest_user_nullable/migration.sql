@@ -1,0 +1,2 @@
+ALTER TABLE `Booking`
+  MODIFY COLUMN `userId` INT NULL;

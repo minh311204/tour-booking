@@ -1,0 +1,932 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common'
+import { Prisma } from '@prisma/client'
+import { PrismaService } from '../prisma/prima.service'
+import { TourTagService } from './tour-tag.service'
+import {
+  CreateTourSchema,
+  TourListQuerySchema,
+  UpdateTourSchema,
+  CreateTourTransportSchema,
+  UpdateTourTransportSchema,
+  CreateTourAccommodationSchema,
+  UpdateTourAccommodationSchema,
+  CreateTourMealSchema,
+  UpdateTourMealSchema,
+} from '../../../shared/schema/tour.schema'
+import type { z } from 'zod'
+
+type CreateTourInput = z.infer<typeof CreateTourSchema>
+type UpdateTourInput = z.infer<typeof UpdateTourSchema>
+type TourListQuery = z.infer<typeof TourListQuerySchema>
+type CreateTourTransportInput = z.infer<typeof CreateTourTransportSchema>
+type UpdateTourTransportInput = z.infer<typeof UpdateTourTransportSchema>
+type CreateTourAccommodationInput = z.infer<typeof CreateTourAccommodationSchema>
+type UpdateTourAccommodationInput = z.infer<typeof UpdateTourAccommodationSchema>
+type CreateTourMealInput = z.infer<typeof CreateTourMealSchema>
+type UpdateTourMealInput = z.infer<typeof UpdateTourMealSchema>
+
+function num(d: unknown): number | null {
+  if (d == null) return null
+  return Number(d)
+}
+
+function iso(d: Date | null | undefined): string | null {
+  if (d == null) return null
+  return d.toISOString()
+}
+
+function validateSchedulePayload(
+  startDate: Date,
+  endDate: Date,
+  availableSeats?: number | null,
+  bookedSeats?: number | null,
+) {
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+    throw new BadRequestException('Invalid schedule date')
+  }
+  if (endDate <= startDate) {
+    throw new BadRequestException('Schedule endDate must be after startDate')
+  }
+  if (
+    availableSeats != null &&
+    bookedSeats != null &&
+    bookedSeats > availableSeats
+  ) {
+    throw new BadRequestException(
+      'Schedule bookedSeats cannot exceed availableSeats',
+    )
+  }
+}
+
+/** Lọc ngân sách theo basePrice (VND) — khớp UI: dưới 5tr / 5–10tr / … */
+function budgetWhere(
+  budget: z.infer<typeof TourListQuerySchema>['budget'],
+): Prisma.TourWhereInput {
+  if (!budget) return {}
+  const m = 1_000_000
+  switch (budget) {
+    case 'under_5m':
+      return { basePrice: { lt: 5 * m } }
+    case '5_10m':
+      return { basePrice: { gte: 5 * m, lt: 10 * m } }
+    case '10_20m':
+      return { basePrice: { gte: 10 * m, lt: 20 * m } }
+    case 'over_20m':
+      return { basePrice: { gte: 20 * m } }
+    default:
+      return {}
+  }
+}
+
+@Injectable()
+export class TourService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tourTagService: TourTagService,
+  ) {}
+
+  // ---------- Tours (list & detail) ----------
+
+  async getTours(query: TourListQuery) {
+    const isActive =
+      query.isActive === 'true'
+        ? true
+        : query.isActive === 'false'
+          ? false
+          : undefined
+
+    let departureScheduleFilter: Prisma.TourWhereInput | undefined
+    if (query.departureDate) {
+      const start = new Date(`${query.departureDate}T00:00:00.000Z`)
+      const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+      departureScheduleFilter = {
+        schedules: {
+          some: {
+            startDate: { gte: start, lt: end },
+          },
+        },
+      }
+    }
+
+    const where: Prisma.TourWhereInput = {
+      ...(query.departureLocationId != null
+        ? { departureLocationId: query.departureLocationId }
+        : {}),
+      ...(query.destinationLocationId != null
+        ? { destinationLocationId: query.destinationLocationId }
+        : {}),
+      ...(isActive !== undefined ? { isActive } : {}),
+      ...(query.q ? { name: { contains: query.q } } : {}),
+      ...budgetWhere(query.budget),
+      ...(query.tourLine ? { tourLine: query.tourLine } : {}),
+      ...(query.transportType ? { transportType: query.transportType } : {}),
+      ...(query.featured === 'true' ? { isFeatured: true } : {}),
+      ...(departureScheduleFilter ?? {}),
+    }
+
+    const listInclude = {
+      departureLocation: { select: { id: true, name: true } },
+      destinationLocation: { select: { id: true, name: true } },
+      schedules: {
+        where: { status: { not: 'CANCELLED' as const } },
+        orderBy: { startDate: 'asc' as const },
+        take: 5,
+      },
+    } satisfies Prisma.TourInclude
+
+    const paginate = query.page != null || query.pageSize != null
+
+    if (paginate) {
+      const page = query.page ?? 1
+      const pageSize = query.pageSize ?? 12
+      const [total, rows] = await Promise.all([
+        this.prisma.tour.count({ where }),
+        this.prisma.tour.findMany({
+          where,
+          include: listInclude,
+          orderBy: [{ createdAtUtc: 'desc' }, { id: 'desc' }],
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+        }),
+      ])
+      return {
+        items: rows.map((t) => this.mapTourListRow(t)),
+        total,
+        page,
+        pageSize,
+      }
+    }
+
+    const rows = await this.prisma.tour.findMany({
+      where,
+      include: listInclude,
+      orderBy: [{ createdAtUtc: 'desc' }, { id: 'desc' }],
+    })
+
+    return rows.map((t) => this.mapTourListRow(t))
+  }
+
+  private mapTourListRow(t: {
+    id: number
+    departureLocationId: number
+    destinationLocationId: number
+    name: string
+    slug: string | null
+    description: string | null
+    durationDays: number | null
+    basePrice: unknown
+    maxPeople: number | null
+    thumbnailUrl: string | null
+    ratingAvg: unknown
+    totalReviews: number | null
+    tourLine: string | null
+    transportType: string | null
+    isActive: boolean | null
+    isFeatured: boolean | null
+    createdAtUtc: Date | null
+    departureLocation: { id: number; name: string | null } | null
+    destinationLocation: { id: number; name: string | null } | null
+    schedules: Array<{
+      id: number
+      startDate: Date
+      priceOverride: unknown
+      availableSeats: number | null
+      bookedSeats: number | null
+    }>
+  }) {
+    return {
+      id: t.id,
+      departureLocationId: t.departureLocationId,
+      destinationLocationId: t.destinationLocationId,
+      name: t.name,
+      slug: t.slug,
+      description: t.description,
+      durationDays: t.durationDays,
+      basePrice: num(t.basePrice),
+      maxPeople: t.maxPeople,
+      thumbnailUrl: t.thumbnailUrl,
+      ratingAvg: t.ratingAvg,
+      totalReviews: t.totalReviews,
+      tourLine: t.tourLine,
+      transportType: t.transportType,
+      isActive: t.isActive,
+      isFeatured: t.isFeatured ?? false,
+      createdAtUtc: iso(t.createdAtUtc),
+      departureLocation: t.departureLocation
+        ? { id: t.departureLocation.id, name: t.departureLocation.name }
+        : undefined,
+      destinationLocation: t.destinationLocation
+        ? { id: t.destinationLocation.id, name: t.destinationLocation.name }
+        : undefined,
+      schedules: t.schedules.map((s) => ({
+        id: s.id,
+        startDate: iso(s.startDate),
+        priceOverride: num(s.priceOverride),
+        remainingSeats:
+          s.availableSeats != null && s.bookedSeats != null
+            ? s.availableSeats - s.bookedSeats
+            : null,
+      })),
+    }
+  }
+
+  private async loadTourDetail(id: number) {
+    const t = await this.prisma.tour.findUnique({
+      where: { id },
+      include: {
+        departureLocation: { select: { id: true, name: true } },
+        destinationLocation: { select: { id: true, name: true } },
+        images: { orderBy: { id: 'asc' } },
+        videos: { orderBy: { id: 'asc' } },
+        schedules: { orderBy: { startDate: 'asc' } },
+        itineraries: {
+          orderBy: { dayNumber: 'asc' },
+          include: {
+            accommodations: {
+              include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+              orderBy: { id: 'asc' },
+            },
+            meals: {
+              include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+              orderBy: { id: 'asc' },
+            },
+          },
+        },
+        tags: { include: { tag: true } },
+        transports: {
+          include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+          orderBy: { legOrder: 'asc' },
+        },
+      },
+    })
+    if (!t) return null
+
+    return {
+      id: t.id,
+      departureLocationId: t.departureLocationId,
+      destinationLocationId: t.destinationLocationId,
+      name: t.name,
+      slug: t.slug,
+      description: t.description,
+      durationDays: t.durationDays,
+      basePrice: num(t.basePrice),
+      maxPeople: t.maxPeople,
+      thumbnailUrl: t.thumbnailUrl,
+      ratingAvg: t.ratingAvg,
+      totalReviews: t.totalReviews,
+      tourLine: t.tourLine,
+      transportType: t.transportType,
+      isActive: t.isActive,
+      isFeatured: t.isFeatured ?? false,
+      createdAtUtc: iso(t.createdAtUtc),
+      inclusions: t.inclusions,
+      exclusions: t.exclusions,
+      cancellationPolicy: t.cancellationPolicy,
+      departureLocation: t.departureLocation
+        ? { id: t.departureLocation.id, name: t.departureLocation.name }
+        : undefined,
+      destinationLocation: t.destinationLocation
+        ? { id: t.destinationLocation.id, name: t.destinationLocation.name }
+        : undefined,
+      images: t.images.map((i) => ({
+        id: i.id,
+        tourId: i.tourId,
+        imageUrl: i.imageUrl,
+        isThumbnail: i.isThumbnail,
+      })),
+      videos: t.videos.map((v) => ({
+        id: v.id,
+        tourId: v.tourId,
+        videoUrl: v.videoUrl,
+      })),
+      schedules: t.schedules.map((s) => ({
+        id: s.id,
+        tourId: s.tourId,
+        startDate: s.startDate.toISOString(),
+        endDate: s.endDate.toISOString(),
+        availableSeats: s.availableSeats,
+        bookedSeats: s.bookedSeats,
+        priceOverride: num(s.priceOverride),
+        status: s.status,
+      })),
+      itineraries: t.itineraries.map((it) => ({
+        id: it.id,
+        tourId: it.tourId,
+        dayNumber: it.dayNumber,
+        title: it.title,
+        description: it.description,
+        accommodations: it.accommodations.map((a) => ({
+          id: a.id,
+          itineraryId: a.itineraryId,
+          supplierId: a.supplierId,
+          supplier: a.supplier,
+          hotelName: a.hotelName,
+          starRating: a.starRating,
+          roomType: a.roomType,
+          checkInNote: a.checkInNote,
+          checkOutNote: a.checkOutNote,
+          address: a.address,
+          mapUrl: a.mapUrl,
+        })),
+        meals: it.meals.map((m) => ({
+          id: m.id,
+          itineraryId: m.itineraryId,
+          supplierId: m.supplierId,
+          supplier: m.supplier,
+          mealType: m.mealType,
+          restaurantName: m.restaurantName,
+          menuStyle: m.menuStyle,
+          dietaryNotes: m.dietaryNotes,
+        })),
+      })),
+      tags: t.tags.map((m) => ({
+        id: m.tag.id,
+        name: m.tag.name,
+      })),
+      transports: t.transports.map((tr) => ({
+        id: tr.id,
+        tourId: tr.tourId,
+        supplierId: tr.supplierId,
+        supplier: tr.supplier,
+        legOrder: tr.legOrder,
+        vehicleType: tr.vehicleType,
+        vehicleDetail: tr.vehicleDetail,
+        seatClass: tr.seatClass,
+        departurePoint: tr.departurePoint,
+        arrivalPoint: tr.arrivalPoint,
+        estimatedHours: num(tr.estimatedHours),
+        notes: tr.notes,
+      })),
+    }
+  }
+
+  async getTourById(id: number) {
+    const detail = await this.loadTourDetail(id)
+    if (!detail) throw new NotFoundException('Tour not found')
+    return detail
+  }
+
+  async createTour(body: CreateTourInput) {
+    const [depLoc, destLoc] = await Promise.all([
+      this.prisma.location.findUnique({ where: { id: body.departureLocationId } }),
+      this.prisma.location.findUnique({ where: { id: body.destinationLocationId } }),
+    ])
+    if (!depLoc || !destLoc) throw new NotFoundException('Location not found')
+
+    if (body.tagIds?.length) {
+      await this.tourTagService.assertTagsExist(body.tagIds)
+    }
+
+    body.schedules?.forEach((s) => {
+      validateSchedulePayload(
+        new Date(s.startDate),
+        new Date(s.endDate),
+        s.availableSeats,
+        s.bookedSeats,
+      )
+    })
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      const tour = await tx.tour.create({
+        data: {
+          departureLocationId: body.departureLocationId,
+          destinationLocationId: body.destinationLocationId,
+          name: body.name,
+          slug: body.slug,
+          description: body.description,
+          durationDays: body.durationDays,
+          basePrice: body.basePrice,
+          maxPeople: body.maxPeople,
+          thumbnailUrl: body.thumbnailUrl || undefined,
+          tourLine: body.tourLine,
+          transportType: body.transportType,
+          isActive: body.isActive ?? true,
+          isFeatured: body.isFeatured ?? false,
+          inclusions: body.inclusions,
+          exclusions: body.exclusions,
+          cancellationPolicy: body.cancellationPolicy,
+          images: body.images?.length
+            ? {
+                create: body.images.map((im) => ({
+                  imageUrl: im.imageUrl,
+                  isThumbnail: im.isThumbnail ?? false,
+                })),
+              }
+            : undefined,
+          videos: body.videos?.length
+            ? {
+                create: body.videos.map((v) => ({ videoUrl: v.videoUrl })),
+              }
+            : undefined,
+          schedules: body.schedules?.length
+            ? {
+                create: body.schedules.map((s) => ({
+                  startDate: new Date(s.startDate),
+                  endDate: new Date(s.endDate),
+                  availableSeats: s.availableSeats,
+                  bookedSeats: s.bookedSeats,
+                  priceOverride: s.priceOverride,
+                  status: s.status,
+                })),
+              }
+            : undefined,
+          itineraries: body.itineraries?.length
+            ? {
+                create: body.itineraries.map((it) => ({
+                  dayNumber: it.dayNumber,
+                  title: it.title,
+                  description: it.description,
+                })),
+              }
+            : undefined,
+          tags: body.tagIds?.length
+            ? {
+                create: body.tagIds.map((tagId) => ({ tagId })),
+              }
+            : undefined,
+        },
+      })
+      return tour.id
+    })
+
+    const detail = await this.loadTourDetail(created)
+    if (!detail) throw new NotFoundException('Tour not found after create')
+    return detail
+  }
+
+  async updateTour(id: number, body: UpdateTourInput) {
+    const existing = await this.prisma.tour.findUnique({ where: { id } })
+    if (!existing) throw new NotFoundException('Tour not found')
+
+    if (body.departureLocationId != null) {
+      const l = await this.prisma.location.findUnique({
+        where: { id: body.departureLocationId },
+      })
+      if (!l) throw new NotFoundException('Departure location not found')
+    }
+    if (body.destinationLocationId != null) {
+      const l = await this.prisma.location.findUnique({
+        where: { id: body.destinationLocationId },
+      })
+      if (!l) throw new NotFoundException('Destination location not found')
+    }
+    if (body.tagIds) {
+      await this.tourTagService.assertTagsExist(body.tagIds)
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.tour.update({
+        where: { id },
+        data: {
+          departureLocationId: body.departureLocationId,
+          destinationLocationId: body.destinationLocationId,
+          name: body.name,
+          slug: body.slug,
+          description: body.description,
+          durationDays: body.durationDays,
+          basePrice: body.basePrice,
+          maxPeople: body.maxPeople,
+          thumbnailUrl: body.thumbnailUrl,
+          tourLine: body.tourLine,
+          transportType: body.transportType,
+          isActive: body.isActive,
+          isFeatured: body.isFeatured ?? undefined,
+          inclusions: body.inclusions,
+          exclusions: body.exclusions,
+          cancellationPolicy: body.cancellationPolicy,
+        },
+      })
+
+      if (body.tagIds) {
+        await tx.tourTagMapping.deleteMany({ where: { tourId: id } })
+        if (body.tagIds.length) {
+          await tx.tourTagMapping.createMany({
+            data: body.tagIds.map((tagId) => ({ tourId: id, tagId })),
+          })
+        }
+      }
+    })
+
+    return this.getTourById(id)
+  }
+
+  async deleteTour(id: number) {
+    const existing = await this.prisma.tour.findUnique({ where: { id } })
+    if (!existing) throw new NotFoundException('Tour not found')
+    await this.prisma.tour.delete({ where: { id } })
+    return { message: 'Tour deleted' }
+  }
+
+  async setTourTags(tourId: number, tagIds: number[]) {
+    await this.getTourById(tourId)
+    await this.tourTagService.assertTagsExist(tagIds)
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.tourTagMapping.deleteMany({ where: { tourId } })
+      if (tagIds.length) {
+        await tx.tourTagMapping.createMany({
+          data: tagIds.map((tagId) => ({ tourId, tagId })),
+        })
+      }
+    })
+
+    return this.getTourById(tourId)
+  }
+
+  // ---------- Schedules ----------
+
+  async addSchedule(
+    tourId: number,
+    body: {
+      startDate: string
+      endDate: string
+      availableSeats?: number
+      bookedSeats?: number
+      priceOverride?: number
+      status?: string
+    },
+  ) {
+    await this.getTourById(tourId)
+    const startDate = new Date(body.startDate)
+    const endDate = new Date(body.endDate)
+    validateSchedulePayload(
+      startDate,
+      endDate,
+      body.availableSeats,
+      body.bookedSeats,
+    )
+    const s = await this.prisma.tourSchedule.create({
+      data: {
+        tourId,
+        startDate,
+        endDate,
+        availableSeats: body.availableSeats,
+        bookedSeats: body.bookedSeats,
+        priceOverride: body.priceOverride,
+        status: body.status,
+      },
+    })
+    return {
+      id: s.id,
+      tourId: s.tourId,
+      startDate: s.startDate.toISOString(),
+      endDate: s.endDate.toISOString(),
+      availableSeats: s.availableSeats,
+      bookedSeats: s.bookedSeats,
+      priceOverride: num(s.priceOverride),
+      status: s.status,
+    }
+  }
+
+  async updateSchedule(
+    scheduleId: number,
+    body: Partial<{
+      startDate: string
+      endDate: string
+      availableSeats: number
+      bookedSeats: number
+      priceOverride: number
+      status: string
+    }>,
+  ) {
+    const current = await this.prisma.tourSchedule.findUnique({
+      where: { id: scheduleId },
+    })
+    if (!current) throw new NotFoundException('Schedule not found')
+
+    const nextStartDate = body.startDate
+      ? new Date(body.startDate)
+      : current.startDate
+    const nextEndDate = body.endDate ? new Date(body.endDate) : current.endDate
+    const nextAvailableSeats = body.availableSeats ?? current.availableSeats
+    const nextBookedSeats = body.bookedSeats ?? current.bookedSeats
+
+    validateSchedulePayload(
+      nextStartDate,
+      nextEndDate,
+      nextAvailableSeats,
+      nextBookedSeats,
+    )
+
+    const s = await this.prisma.tourSchedule.update({
+      where: { id: scheduleId },
+      data: {
+        startDate: body.startDate ? nextStartDate : undefined,
+        endDate: body.endDate ? nextEndDate : undefined,
+        availableSeats: body.availableSeats,
+        bookedSeats: body.bookedSeats,
+        priceOverride: body.priceOverride,
+        status: body.status,
+      },
+    })
+    return {
+      id: s.id,
+      tourId: s.tourId,
+      startDate: s.startDate.toISOString(),
+      endDate: s.endDate.toISOString(),
+      availableSeats: s.availableSeats,
+      bookedSeats: s.bookedSeats,
+      priceOverride: num(s.priceOverride),
+      status: s.status,
+    }
+  }
+
+  async removeSchedule(scheduleId: number) {
+    const row = await this.prisma.tourSchedule.findUnique({
+      where: { id: scheduleId },
+    })
+    if (!row) throw new NotFoundException('Schedule not found')
+    await this.prisma.tourSchedule.delete({ where: { id: scheduleId } })
+    return { message: 'Schedule removed' }
+  }
+
+  // ---------- Itineraries ----------
+
+  async addItinerary(
+    tourId: number,
+    body: { dayNumber: number; title?: string; description?: string },
+  ) {
+    await this.getTourById(tourId)
+    const it = await this.prisma.tourItinerary.create({
+      data: {
+        tourId,
+        dayNumber: body.dayNumber,
+        title: body.title,
+        description: body.description,
+      },
+    })
+    return {
+      id: it.id,
+      tourId: it.tourId,
+      dayNumber: it.dayNumber,
+      title: it.title,
+      description: it.description,
+    }
+  }
+
+  async updateItinerary(
+    itineraryId: number,
+    body: Partial<{ dayNumber: number; title: string; description: string }>,
+  ) {
+    const it = await this.prisma.tourItinerary.update({
+      where: { id: itineraryId },
+      data: {
+        dayNumber: body.dayNumber,
+        title: body.title,
+        description: body.description,
+      },
+    })
+    return {
+      id: it.id,
+      tourId: it.tourId,
+      dayNumber: it.dayNumber,
+      title: it.title,
+      description: it.description,
+    }
+  }
+
+  async removeItinerary(itineraryId: number) {
+    const row = await this.prisma.tourItinerary.findUnique({
+      where: { id: itineraryId },
+    })
+    if (!row) throw new NotFoundException('Itinerary not found')
+    await this.prisma.tourItinerary.delete({ where: { id: itineraryId } })
+    return { message: 'Itinerary removed' }
+  }
+
+  // ---------- Transports ----------
+
+  private formatTransport(tr: {
+    id: number
+    tourId: number
+    supplierId: number | null
+    supplier: { id: number; name: string; type: any; phone: string | null } | null
+    legOrder: number
+    vehicleType: any
+    vehicleDetail: string | null
+    seatClass: string | null
+    departurePoint: string
+    arrivalPoint: string
+    estimatedHours: any
+    notes: string | null
+  }) {
+    return {
+      id: tr.id,
+      tourId: tr.tourId,
+      supplierId: tr.supplierId,
+      supplier: tr.supplier,
+      legOrder: tr.legOrder,
+      vehicleType: tr.vehicleType,
+      vehicleDetail: tr.vehicleDetail,
+      seatClass: tr.seatClass,
+      departurePoint: tr.departurePoint,
+      arrivalPoint: tr.arrivalPoint,
+      estimatedHours: num(tr.estimatedHours),
+      notes: tr.notes,
+    }
+  }
+
+  async addTransport(tourId: number, body: CreateTourTransportInput) {
+    await this.getTourById(tourId)
+    const tr = await this.prisma.tourTransport.create({
+      data: {
+        tourId,
+        supplierId: body.supplierId,
+        legOrder: body.legOrder,
+        vehicleType: body.vehicleType,
+        vehicleDetail: body.vehicleDetail,
+        seatClass: body.seatClass,
+        departurePoint: body.departurePoint,
+        arrivalPoint: body.arrivalPoint,
+        estimatedHours: body.estimatedHours,
+        notes: body.notes,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatTransport(tr)
+  }
+
+  async updateTransport(transportId: number, body: UpdateTourTransportInput) {
+    const existing = await this.prisma.tourTransport.findUnique({
+      where: { id: transportId },
+    })
+    if (!existing) throw new NotFoundException('Transport not found')
+    const tr = await this.prisma.tourTransport.update({
+      where: { id: transportId },
+      data: {
+        supplierId: body.supplierId,
+        legOrder: body.legOrder,
+        vehicleType: body.vehicleType,
+        vehicleDetail: body.vehicleDetail,
+        seatClass: body.seatClass,
+        departurePoint: body.departurePoint,
+        arrivalPoint: body.arrivalPoint,
+        estimatedHours: body.estimatedHours,
+        notes: body.notes,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatTransport(tr)
+  }
+
+  async removeTransport(transportId: number) {
+    const row = await this.prisma.tourTransport.findUnique({
+      where: { id: transportId },
+    })
+    if (!row) throw new NotFoundException('Transport not found')
+    await this.prisma.tourTransport.delete({ where: { id: transportId } })
+    return { message: 'Transport removed' }
+  }
+
+  // ---------- Accommodations ----------
+
+  private formatAccommodation(a: {
+    id: number
+    itineraryId: number
+    supplierId: number | null
+    supplier: { id: number; name: string; type: any; phone: string | null } | null
+    hotelName: string
+    starRating: number | null
+    roomType: string | null
+    checkInNote: string | null
+    checkOutNote: string | null
+    address: string | null
+    mapUrl: string | null
+  }) {
+    return {
+      id: a.id,
+      itineraryId: a.itineraryId,
+      supplierId: a.supplierId,
+      supplier: a.supplier,
+      hotelName: a.hotelName,
+      starRating: a.starRating,
+      roomType: a.roomType,
+      checkInNote: a.checkInNote,
+      checkOutNote: a.checkOutNote,
+      address: a.address,
+      mapUrl: a.mapUrl,
+    }
+  }
+
+  async addAccommodation(itineraryId: number, body: CreateTourAccommodationInput) {
+    const itinerary = await this.prisma.tourItinerary.findUnique({
+      where: { id: itineraryId },
+    })
+    if (!itinerary) throw new NotFoundException('Itinerary not found')
+
+    const a = await this.prisma.tourAccommodation.create({
+      data: {
+        itineraryId,
+        supplierId: body.supplierId,
+        hotelName: body.hotelName,
+        starRating: body.starRating,
+        roomType: body.roomType,
+        checkInNote: body.checkInNote,
+        checkOutNote: body.checkOutNote,
+        address: body.address,
+        mapUrl: body.mapUrl,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatAccommodation(a)
+  }
+
+  async updateAccommodation(accommodationId: number, body: UpdateTourAccommodationInput) {
+    const existing = await this.prisma.tourAccommodation.findUnique({
+      where: { id: accommodationId },
+    })
+    if (!existing) throw new NotFoundException('Accommodation not found')
+    const a = await this.prisma.tourAccommodation.update({
+      where: { id: accommodationId },
+      data: {
+        supplierId: body.supplierId,
+        hotelName: body.hotelName,
+        starRating: body.starRating,
+        roomType: body.roomType,
+        checkInNote: body.checkInNote,
+        checkOutNote: body.checkOutNote,
+        address: body.address,
+        mapUrl: body.mapUrl,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatAccommodation(a)
+  }
+
+  async removeAccommodation(accommodationId: number) {
+    const row = await this.prisma.tourAccommodation.findUnique({
+      where: { id: accommodationId },
+    })
+    if (!row) throw new NotFoundException('Accommodation not found')
+    await this.prisma.tourAccommodation.delete({ where: { id: accommodationId } })
+    return { message: 'Accommodation removed' }
+  }
+
+  // ---------- Meals ----------
+
+  private formatMeal(m: {
+    id: number
+    itineraryId: number
+    supplierId: number | null
+    supplier: { id: number; name: string; type: any; phone: string | null } | null
+    mealType: any
+    restaurantName: string | null
+    menuStyle: string | null
+    dietaryNotes: string | null
+  }) {
+    return {
+      id: m.id,
+      itineraryId: m.itineraryId,
+      supplierId: m.supplierId,
+      supplier: m.supplier,
+      mealType: m.mealType,
+      restaurantName: m.restaurantName,
+      menuStyle: m.menuStyle,
+      dietaryNotes: m.dietaryNotes,
+    }
+  }
+
+  async addMeal(itineraryId: number, body: CreateTourMealInput) {
+    const itinerary = await this.prisma.tourItinerary.findUnique({
+      where: { id: itineraryId },
+    })
+    if (!itinerary) throw new NotFoundException('Itinerary not found')
+
+    const m = await this.prisma.tourMeal.create({
+      data: {
+        itineraryId,
+        supplierId: body.supplierId,
+        mealType: body.mealType,
+        restaurantName: body.restaurantName,
+        menuStyle: body.menuStyle,
+        dietaryNotes: body.dietaryNotes,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatMeal(m)
+  }
+
+  async updateMeal(mealId: number, body: UpdateTourMealInput) {
+    const existing = await this.prisma.tourMeal.findUnique({ where: { id: mealId } })
+    if (!existing) throw new NotFoundException('Meal not found')
+    const m = await this.prisma.tourMeal.update({
+      where: { id: mealId },
+      data: {
+        supplierId: body.supplierId,
+        mealType: body.mealType,
+        restaurantName: body.restaurantName,
+        menuStyle: body.menuStyle,
+        dietaryNotes: body.dietaryNotes,
+      },
+      include: { supplier: { select: { id: true, name: true, type: true, phone: true } } },
+    })
+    return this.formatMeal(m)
+  }
+
+  async removeMeal(mealId: number) {
+    const row = await this.prisma.tourMeal.findUnique({ where: { id: mealId } })
+    if (!row) throw new NotFoundException('Meal not found')
+    await this.prisma.tourMeal.delete({ where: { id: mealId } })
+    return { message: 'Meal removed' }
+  }
+}
