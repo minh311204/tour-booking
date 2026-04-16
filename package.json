@@ -22,7 +22,9 @@
     "db:seed": "prisma db seed --config src/api/prisma.config.ts",
     "dev:admin": "npm run dev --prefix src/admin",
     "dev:user": "npm run dev --prefix src/user",
-    "dev:api": "nest start --watch"
+    "dev:api": "nest start --watch",
+    "build": "prisma generate --schema=src/api/prisma/schema.prisma && nest build",
+    "postinstall": "prisma generate --schema=src/api/prisma/schema.prisma"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1026.0",
